@@ -192,22 +192,23 @@ def start_tryon(
         }
 
         pipe = TryonPipeline.from_pretrained(**pipe_param).to(device)
-        pipe.unet_encoder = (
-            UNet_Encoder  # Assign unet_encoder before wrapping with DataParallel
-        )
+        pipe.unet_encoder = UNet_Encoder
 
-        # Apply DataParallel to pipe only if multiple GPUs are available
         if len(device_ids) > 1:
             pipe = nn.DataParallel(pipe, device_ids=device_ids)
             print("Applied DataParallel to pipe across GPUs:", device_ids)
 
         if load_mode == "4bit":
-            if (
-                pipe.module.text_encoder is not None
-            ):  # Access via .module for DataParallel
-                quantize_4bit(pipe.module.text_encoder)
-            if pipe.module.text_encoder_2 is not None:
-                quantize_4bit(pipe.module.text_encoder_2)
+            if len(device_ids) > 1:
+                if pipe.module.text_encoder is not None:
+                    quantize_4bit(pipe.module.text_encoder)
+                if pipe.module.text_encoder_2 is not None:
+                    quantize_4bit(pipe.module.text_encoder_2)
+            else:
+                if pipe.text_encoder is not None:
+                    quantize_4bit(pipe.text_encoder)
+                if pipe.text_encoder_2 is not None:
+                    quantize_4bit(pipe.text_encoder_2)
     else:
         if ENABLE_CPU_OFFLOAD:
             need_restart_cpu_offloading = True
@@ -226,7 +227,11 @@ def start_tryon(
     if need_restart_cpu_offloading:
         restart_cpu_offload(pipe, load_mode)
     elif ENABLE_CPU_OFFLOAD:
-        pipe.enable_model_cpu_offload()
+        (
+            pipe.enable_model_cpu_offload()
+            if len(device_ids) <= 1
+            else pipe.module.enable_model_cpu_offload()
+        )
 
     garm_img = garm_img.convert("RGB").resize((768, 1024))
     human_img_orig = dict["background"].convert("RGB")
@@ -343,105 +348,99 @@ def start_tryon(
             pipe.text_encoder_2.to(device)
 
     with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
-            with torch.no_grad():
-                prompt = "model is wearing " + garment_des
+        with torch.amp.autocast(device_type="cuda", dtype=dtype):  # Updated autocast
+            prompt = "model is wearing " + garment_des
+            negative_prompt = (
+                "monochrome, lowres, bad anatomy, worst quality, low quality"
+            )
+            with torch.inference_mode():
+                pipe_to_use = pipe.module if len(device_ids) > 1 else pipe
+                (
+                    prompt_embeds,
+                    negative_prompt_embeds,
+                    pooled_prompt_embeds,
+                    negative_pooled_prompt_embeds,
+                ) = pipe_to_use.encode_prompt(
+                    prompt,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=True,
+                    negative_prompt=negative_prompt,
+                )
+                prompt = "a photo of " + garment_des
                 negative_prompt = (
                     "monochrome, lowres, bad anatomy, worst quality, low quality"
                 )
+                if not isinstance(prompt, List):
+                    prompt = [prompt] * 1
+                if not isinstance(negative_prompt, List):
+                    negative_prompt = [negative_prompt] * 1
                 with torch.inference_mode():
                     (
-                        prompt_embeds,
-                        negative_prompt_embeds,
-                        pooled_prompt_embeds,
-                        negative_pooled_prompt_embeds,
-                    ) = pipe.encode_prompt(
+                        prompt_embeds_c,
+                        _,
+                        _,
+                        _,
+                    ) = pipe_to_use.encode_prompt(
                         prompt,
                         num_images_per_prompt=1,
-                        do_classifier_free_guidance=True,
+                        do_classifier_free_guidance=False,
                         negative_prompt=negative_prompt,
                     )
-                    prompt = "a photo of " + garment_des
-                    negative_prompt = (
-                        "monochrome, lowres, bad anatomy, worst quality, low quality"
+                pose_img_tensor = (
+                    tensor_transfrom(pose_img).unsqueeze(0).to(device, dtype)
+                )
+                garm_tensor = tensor_transfrom(garm_img).unsqueeze(0).to(device, dtype)
+                results = []
+                current_seed = seed
+                for i in range(number_of_images):
+                    if is_randomize_seed:
+                        current_seed = torch.randint(0, 2**32, size=(1,)).item()
+                    generator = (
+                        torch.Generator(device).manual_seed(current_seed)
+                        if seed != -1
+                        else None
                     )
-                    if not isinstance(prompt, List):
-                        prompt = [prompt] * 1
-                    if not isinstance(negative_prompt, List):
-                        negative_prompt = [negative_prompt] * 1
-                    with torch.inference_mode():
-                        (
-                            prompt_embeds_c,
-                            _,
-                            _,
-                            _,
-                        ) = pipe.encode_prompt(
-                            prompt,
-                            num_images_per_prompt=1,
-                            do_classifier_free_guidance=False,
-                            negative_prompt=negative_prompt,
+                    current_seed = current_seed + i
+                    images = pipe_to_use(
+                        prompt_embeds=prompt_embeds.to(device, dtype),
+                        negative_prompt_embeds=negative_prompt_embeds.to(device, dtype),
+                        pooled_prompt_embeds=pooled_prompt_embeds.to(device, dtype),
+                        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(
+                            device, dtype
+                        ),
+                        num_inference_steps=denoise_steps,
+                        generator=generator,
+                        strength=1.0,
+                        pose_img=pose_img_tensor.to(device, dtype),
+                        text_embeds_cloth=prompt_embeds_c.to(device, dtype),
+                        cloth=garm_tensor.to(device, dtype),
+                        mask_image=mask,
+                        image=human_img,
+                        height=1024,
+                        width=768,
+                        ip_adapter_image=garm_img.resize((768, 1024)),
+                        guidance_scale=2.0,
+                    )[0]
+                    if is_checked_crop:
+                        final_img = final_background.copy()
+                        gen_img = images[0].resize(crop_size)
+                        final_img.paste(gen_img, (left_final, top_final))
+                        print(
+                            f"start_tryon: Pasted generated image onto final background at ({left_final}, {top_final})"
                         )
-                    pose_img_tensor = (
-                        tensor_transfrom(pose_img).unsqueeze(0).to(device, dtype)
-                    )
-                    garm_tensor = (
-                        tensor_transfrom(garm_img).unsqueeze(0).to(device, dtype)
-                    )
-                    results = []
-                    current_seed = seed
-                    for i in range(number_of_images):
-                        if is_randomize_seed:
-                            current_seed = torch.randint(0, 2**32, size=(1,)).item()
-                        generator = (
-                            torch.Generator(device).manual_seed(current_seed)
-                            if seed != -1
-                            else None
+                        img_path = save_output_image(
+                            final_img,
+                            base_path="outputs",
+                            base_filename="img",
+                            seed=current_seed,
                         )
-                        current_seed = current_seed + i
-                        images = pipe(
-                            prompt_embeds=prompt_embeds.to(device, dtype),
-                            negative_prompt_embeds=negative_prompt_embeds.to(
-                                device, dtype
-                            ),
-                            pooled_prompt_embeds=pooled_prompt_embeds.to(device, dtype),
-                            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(
-                                device, dtype
-                            ),
-                            num_inference_steps=denoise_steps,
-                            generator=generator,
-                            strength=1.0,
-                            pose_img=pose_img_tensor.to(device, dtype),
-                            text_embeds_cloth=prompt_embeds_c.to(device, dtype),
-                            cloth=garm_tensor.to(device, dtype),
-                            mask_image=mask,
-                            image=human_img,
-                            height=1024,
-                            width=768,
-                            ip_adapter_image=garm_img.resize((768, 1024)),
-                            guidance_scale=2.0,
-                            dtype=dtype,
-                            device=device,
-                        )[0]
-                        if is_checked_crop:
-                            final_img = final_background.copy()
-                            gen_img = images[0].resize(crop_size)
-                            final_img.paste(gen_img, (left_final, top_final))
-                            print(
-                                f"start_tryon: Pasted generated image onto final background at ({left_final}, {top_final})"
-                            )
-                            img_path = save_output_image(
-                                final_img,
-                                base_path="outputs",
-                                base_filename="img",
-                                seed=current_seed,
-                            )
-                            results.append(img_path)
-                        else:
-                            img_path = save_output_image(
-                                images[0], base_path="outputs", base_filename="img"
-                            )
-                            results.append(img_path)
-                    return results, mask_gray
+                        results.append(img_path)
+                    else:
+                        img_path = save_output_image(
+                            images[0], base_path="outputs", base_filename="img"
+                        )
+                        results.append(img_path)
+                return results, mask_gray
 
 
 garm_list = os.listdir(os.path.join(example_path, "cloth"))
