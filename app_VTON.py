@@ -530,7 +530,7 @@ with image_blocks as demo:
             with gr.Row():
                 try_button = gr.Button(value="Try-on")
                 denoise_steps = gr.Number(
-                    label="Denoising Steps", minimum=20, maximum=120, value=30, step=1
+                    label="Denoising Steps", minimum=20, maximum=500, value=30, step=1
                 )
                 seed = gr.Number(
                     label="Seed", minimum=-1, maximum=2147483647, step=1, value=1
