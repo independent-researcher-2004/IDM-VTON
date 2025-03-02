@@ -1,6 +1,6 @@
 import gradio as gr
 import argparse, torch, os
-import torch.nn as nn  # Added for DataParallel
+import torch.nn as nn
 from PIL import Image
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
@@ -52,7 +52,6 @@ load_mode = args.load_mode
 fixed_vae = args.fixed_vae
 
 dtype = torch.float16
-# Detect available GPUs and set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device_ids = list(range(torch.cuda.device_count()))  # e.g., [0, 1] for 2 GPUs
 print(f"Using GPUs: {device_ids}")
@@ -76,7 +75,6 @@ UNet_Encoder = None
 example_path = os.path.join(os.path.dirname(__file__), "example")
 
 
-# --- Auto-crop function unchanged ---
 def auto_crop_upload(editor_value, crop_flag):
     global ORIGINAL_IMAGE
     if editor_value is None:
@@ -99,14 +97,14 @@ def auto_crop_upload(editor_value, crop_flag):
             right = (width + target_width) / 2
             bottom = (height + target_height) / 2
             cropped_img = img.crop((left, top, right, bottom))
-            resized_img = cropped_img.resize((1152, 1536))
+            resized_img = cropped_img.resize((768, 1024))
             editor_value["background"] = resized_img
             if editor_value.get("layers"):
                 new_layers = []
                 for layer in editor_value["layers"]:
                     if layer is not None:
                         new_layer = layer.crop((left, top, right, bottom)).resize(
-                            (1152, 1536)
+                            (768, 1024)
                         )
                         new_layers.append(new_layer)
                     else:
@@ -128,7 +126,6 @@ def auto_crop_upload(editor_value, crop_flag):
     return editor_value
 
 
-# --- Modified try-on function for multi-GPU ---
 def start_tryon(
     dict,
     garm_img,
@@ -195,24 +192,22 @@ def start_tryon(
         }
 
         pipe = TryonPipeline.from_pretrained(**pipe_param).to(device)
-        pipe.unet_encoder = UNet_Encoder
-        pipe.unet_encoder.to(pipe.unet.device)
+        pipe.unet_encoder = (
+            UNet_Encoder  # Assign unet_encoder before wrapping with DataParallel
+        )
 
-        # Apply DataParallel if multiple GPUs are available
+        # Apply DataParallel to pipe only if multiple GPUs are available
         if len(device_ids) > 1:
             pipe = nn.DataParallel(pipe, device_ids=device_ids)
-            pipe.unet_encoder = nn.DataParallel(
-                pipe.unet_encoder, device_ids=device_ids
-            )
-            print(
-                "Applied DataParallel to pipe and unet_encoder across GPUs:", device_ids
-            )
+            print("Applied DataParallel to pipe across GPUs:", device_ids)
 
         if load_mode == "4bit":
-            if pipe.text_encoder is not None:
-                quantize_4bit(pipe.text_encoder)
-            if pipe.text_encoder_2 is not None:
-                quantize_4bit(pipe.text_encoder_2)
+            if (
+                pipe.module.text_encoder is not None
+            ):  # Access via .module for DataParallel
+                quantize_4bit(pipe.module.text_encoder)
+            if pipe.module.text_encoder_2 is not None:
+                quantize_4bit(pipe.module.text_encoder_2)
     else:
         if ENABLE_CPU_OFFLOAD:
             need_restart_cpu_offloading = True
@@ -233,11 +228,10 @@ def start_tryon(
     elif ENABLE_CPU_OFFLOAD:
         pipe.enable_model_cpu_offload()
 
-    garm_img = garm_img.convert("RGB").resize((1152, 1536))
+    garm_img = garm_img.convert("RGB").resize((768, 1024))
     human_img_orig = dict["background"].convert("RGB")
     print("start_tryon: Received human image from editor.")
 
-    # --- Stitching logic unchanged ---
     if is_checked_crop:
         if ORIGINAL_IMAGE is not None:
             orig = ORIGINAL_IMAGE
@@ -252,9 +246,9 @@ def start_tryon(
                 orig.size,
             )
         orig_w, orig_h = orig.size
-        scale_factor = 1536 / orig_h
+        scale_factor = 1024 / orig_h
         final_w = int(orig_w * scale_factor)
-        final_h = 1536
+        final_h = 1024
         final_background = orig.resize((final_w, final_h))
         print(
             f"start_tryon: Downscaled original image to final background: {final_background.size} (scale factor: {scale_factor})"
@@ -276,14 +270,14 @@ def start_tryon(
         )
         human_img = human_img_orig
     else:
-        human_img = human_img_orig.resize((1152, 1536))
-        print("start_tryon: Auto crop not enabled, resized human image to 1152x1536.")
+        human_img = human_img_orig.resize((768, 1024))
+        print("start_tryon: Auto crop not enabled, resized human image to 768x1024.")
 
     if is_checked:
         keypoints = openpose_model(human_img.resize((384, 512)))
         model_parse, _ = parsing_model(human_img.resize((384, 512)))
         mask, mask_gray = get_mask_location("hd", category, model_parse, keypoints)
-        mask = mask.resize((1152, 1536))
+        mask = mask.resize((768, 1024))
         print("start_tryon: Auto-masking used")
     else:
         if (
@@ -296,7 +290,7 @@ def start_tryon(
                 mask_alpha = mask_layer.split()[-1]
             else:
                 mask_alpha = mask_layer.convert("L")
-            mask_alpha = mask_alpha.resize((1152, 1536))
+            mask_alpha = mask_alpha.resize((768, 1024))
             print(
                 "start_tryon: Manual mask alpha extracted:",
                 type(mask_alpha),
@@ -311,7 +305,7 @@ def start_tryon(
                 mask.size,
             )
         else:
-            mask = Image.new("L", (1152, 1536), 0)
+            mask = Image.new("L", (768, 1024), 0)
             print("start_tryon: No manual mask provided, using default black mask")
 
     mask_gray = (1 - transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
@@ -334,12 +328,19 @@ def start_tryon(
     )
     pose_img = args_apply.func(args_apply, human_img_arg)
     pose_img = pose_img[:, :, ::-1]
-    pose_img = Image.fromarray(pose_img).resize((1152, 1536))
+    pose_img = Image.fromarray(pose_img).resize((768, 1024))
 
-    if pipe.text_encoder is not None:
-        pipe.text_encoder.to(device)
-    if pipe.text_encoder_2 is not None:
-        pipe.text_encoder_2.to(device)
+    # Adjust text encoder access for DataParallel
+    if len(device_ids) > 1:
+        if pipe.module.text_encoder is not None:
+            pipe.module.text_encoder.to(device)
+        if pipe.module.text_encoder_2 is not None:
+            pipe.module.text_encoder_2.to(device)
+    else:
+        if pipe.text_encoder is not None:
+            pipe.text_encoder.to(device)
+        if pipe.text_encoder_2 is not None:
+            pipe.text_encoder_2.to(device)
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
@@ -414,9 +415,9 @@ def start_tryon(
                             cloth=garm_tensor.to(device, dtype),
                             mask_image=mask,
                             image=human_img,
-                            height=1536,
-                            width=1152,
-                            ip_adapter_image=garm_img.resize((1152, 1536)),
+                            height=1024,
+                            width=768,
+                            ip_adapter_image=garm_img.resize((768, 1024)),
                             guidance_scale=2.0,
                             dtype=dtype,
                             device=device,
