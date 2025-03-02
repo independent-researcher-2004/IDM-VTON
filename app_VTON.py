@@ -1,6 +1,5 @@
 import gradio as gr
 import argparse, torch, os
-import torch.nn as nn
 from PIL import Image
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
@@ -52,10 +51,7 @@ load_mode = args.load_mode
 fixed_vae = args.fixed_vae
 
 dtype = torch.float16
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device_ids = list(range(torch.cuda.device_count()))  # e.g., [0, 1] for 2 GPUs
-print(f"Using GPUs: {device_ids}")
-
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model_id = "yisol/IDM-VTON"
 vae_model_id = "madebyollin/sdxl-vae-fp16-fix"
 
@@ -75,7 +71,13 @@ UNet_Encoder = None
 example_path = os.path.join(os.path.dirname(__file__), "example")
 
 
+# --- New function for auto-cropping on upload ---
 def auto_crop_upload(editor_value, crop_flag):
+    """
+    When a user uploads an image (EditorValue) and if auto-cropping is enabled
+    (crop_flag is True) this function performs the cropping and resizing.
+    It stores the original full resolution image in a global variable and updates the "auto_cropped" flag.
+    """
     global ORIGINAL_IMAGE
     if editor_value is None:
         return None
@@ -84,6 +86,7 @@ def auto_crop_upload(editor_value, crop_flag):
     try:
         img = editor_value["background"].convert("RGB")
         if crop_flag:
+            # Save the original image before cropping so that we can use it later for stitching.
             ORIGINAL_IMAGE = img.copy()
             print(
                 "auto_crop_upload: Original image stored with resolution:",
@@ -97,8 +100,10 @@ def auto_crop_upload(editor_value, crop_flag):
             right = (width + target_width) / 2
             bottom = (height + target_height) / 2
             cropped_img = img.crop((left, top, right, bottom))
+            # Resize the cropped image to the proper dimensions used by the model (768×1024)
             resized_img = cropped_img.resize((768, 1024))
             editor_value["background"] = resized_img
+            # If there are any drawn layers (mask layers), crop and resize them too.
             if editor_value.get("layers"):
                 new_layers = []
                 for layer in editor_value["layers"]:
@@ -110,6 +115,7 @@ def auto_crop_upload(editor_value, crop_flag):
                     else:
                         new_layers.append(None)
                 editor_value["layers"] = new_layers
+            # Optionally update "composite"
             editor_value["composite"] = resized_img
             editor_value["auto_cropped"] = True
             print(
@@ -126,6 +132,7 @@ def auto_crop_upload(editor_value, crop_flag):
     return editor_value
 
 
+# --- Modified try-on function to stitch back the generated image ---
 def start_tryon(
     dict,
     garm_img,
@@ -141,6 +148,7 @@ def start_tryon(
     global pipe, unet, UNet_Encoder, need_restart_cpu_offloading, ORIGINAL_IMAGE
 
     print(f"start_tryon: Input dict from ImageEditor: {dict}")
+    print(f"start_tryon: Full Input dict content: {dict}")
 
     if pipe is None:
         unet = UNet2DConditionModel.from_pretrained(
@@ -165,7 +173,9 @@ def start_tryon(
             vae = AutoencoderKL.from_pretrained(vae_model_id, torch_dtype=dtype)
         else:
             vae = AutoencoderKL.from_pretrained(
-                model_id, subfolder="vae", torch_dtype=dtype
+                model_id,
+                subfolder="vae",
+                torch_dtype=dtype,
             )
 
         UNet_Encoder = UNet2DConditionModel_ref.from_pretrained(
@@ -193,22 +203,13 @@ def start_tryon(
 
         pipe = TryonPipeline.from_pretrained(**pipe_param).to(device)
         pipe.unet_encoder = UNet_Encoder
-
-        if len(device_ids) > 1:
-            pipe = nn.DataParallel(pipe, device_ids=device_ids)
-            print("Applied DataParallel to pipe across GPUs:", device_ids)
+        pipe.unet_encoder.to(pipe.unet.device)
 
         if load_mode == "4bit":
-            if len(device_ids) > 1:
-                if pipe.module.text_encoder is not None:
-                    quantize_4bit(pipe.module.text_encoder)
-                if pipe.module.text_encoder_2 is not None:
-                    quantize_4bit(pipe.module.text_encoder_2)
-            else:
-                if pipe.text_encoder is not None:
-                    quantize_4bit(pipe.text_encoder)
-                if pipe.text_encoder_2 is not None:
-                    quantize_4bit(pipe.text_encoder_2)
+            if pipe.text_encoder is not None:
+                quantize_4bit(pipe.text_encoder)
+            if pipe.text_encoder_2 is not None:
+                quantize_4bit(pipe.text_encoder_2)
     else:
         if ENABLE_CPU_OFFLOAD:
             need_restart_cpu_offloading = True
@@ -227,16 +228,13 @@ def start_tryon(
     if need_restart_cpu_offloading:
         restart_cpu_offload(pipe, load_mode)
     elif ENABLE_CPU_OFFLOAD:
-        (
-            pipe.enable_model_cpu_offload()
-            if len(device_ids) <= 1
-            else pipe.module.enable_model_cpu_offload()
-        )
+        pipe.enable_model_cpu_offload()
 
     garm_img = garm_img.convert("RGB").resize((768, 1024))
     human_img_orig = dict["background"].convert("RGB")
     print("start_tryon: Received human image from editor.")
 
+    # --- New stitching logic when auto-crop is enabled ---
     if is_checked_crop:
         if ORIGINAL_IMAGE is not None:
             orig = ORIGINAL_IMAGE
@@ -273,6 +271,7 @@ def start_tryon(
         print(
             f"start_tryon: Scaled crop region for final image: left_final: {left_final}, top_final: {top_final}, crop_size: {crop_size}"
         )
+        # Use the already auto-cropped human image as model input since it is 768x1024.
         human_img = human_img_orig
     else:
         human_img = human_img_orig.resize((768, 1024))
@@ -313,6 +312,8 @@ def start_tryon(
             mask = Image.new("L", (768, 1024), 0)
             print("start_tryon: No manual mask provided, using default black mask")
 
+    print("start_tryon: Mask before pipe:", type(mask), mask.mode, mask.size)
+
     mask_gray = (1 - transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
     mask_gray = to_pil_image((mask_gray + 1.0) / 2.0)
 
@@ -335,112 +336,112 @@ def start_tryon(
     pose_img = pose_img[:, :, ::-1]
     pose_img = Image.fromarray(pose_img).resize((768, 1024))
 
-    # Adjust text encoder access for DataParallel
-    if len(device_ids) > 1:
-        if pipe.module.text_encoder is not None:
-            pipe.module.text_encoder.to(device)
-        if pipe.module.text_encoder_2 is not None:
-            pipe.module.text_encoder_2.to(device)
-    else:
-        if pipe.text_encoder is not None:
-            pipe.text_encoder.to(device)
-        if pipe.text_encoder_2 is not None:
-            pipe.text_encoder_2.to(device)
+    if pipe.text_encoder is not None:
+        pipe.text_encoder.to(device)
+    if pipe.text_encoder_2 is not None:
+        pipe.text_encoder_2.to(device)
 
     with torch.no_grad():
-        with torch.amp.autocast(device_type="cuda", dtype=dtype):  # Updated autocast
-            prompt = "model is wearing " + garment_des
-            negative_prompt = (
-                "monochrome, lowres, bad anatomy, worst quality, low quality"
-            )
-            with torch.inference_mode():
-                pipe_to_use = pipe.module if len(device_ids) > 1 else pipe
-                (
-                    prompt_embeds,
-                    negative_prompt_embeds,
-                    pooled_prompt_embeds,
-                    negative_pooled_prompt_embeds,
-                ) = pipe_to_use.encode_prompt(
-                    prompt,
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=True,
-                    negative_prompt=negative_prompt,
-                )
-                prompt = "a photo of " + garment_des
+        with torch.cuda.amp.autocast(dtype=dtype):
+            with torch.no_grad():
+                prompt = "model is wearing " + garment_des
                 negative_prompt = (
                     "monochrome, lowres, bad anatomy, worst quality, low quality"
                 )
-                if not isinstance(prompt, List):
-                    prompt = [prompt] * 1
-                if not isinstance(negative_prompt, List):
-                    negative_prompt = [negative_prompt] * 1
                 with torch.inference_mode():
                     (
-                        prompt_embeds_c,
-                        _,
-                        _,
-                        _,
-                    ) = pipe_to_use.encode_prompt(
+                        prompt_embeds,
+                        negative_prompt_embeds,
+                        pooled_prompt_embeds,
+                        negative_pooled_prompt_embeds,
+                    ) = pipe.encode_prompt(
                         prompt,
                         num_images_per_prompt=1,
-                        do_classifier_free_guidance=False,
+                        do_classifier_free_guidance=True,
                         negative_prompt=negative_prompt,
                     )
-                pose_img_tensor = (
-                    tensor_transfrom(pose_img).unsqueeze(0).to(device, dtype)
-                )
-                garm_tensor = tensor_transfrom(garm_img).unsqueeze(0).to(device, dtype)
-                results = []
-                current_seed = seed
-                for i in range(number_of_images):
-                    if is_randomize_seed:
-                        current_seed = torch.randint(0, 2**32, size=(1,)).item()
-                    generator = (
-                        torch.Generator(device).manual_seed(current_seed)
-                        if seed != -1
-                        else None
+                    prompt = "a photo of " + garment_des
+                    negative_prompt = (
+                        "monochrome, lowres, bad anatomy, worst quality, low quality"
                     )
-                    current_seed = current_seed + i
-                    images = pipe_to_use(
-                        prompt_embeds=prompt_embeds.to(device, dtype),
-                        negative_prompt_embeds=negative_prompt_embeds.to(device, dtype),
-                        pooled_prompt_embeds=pooled_prompt_embeds.to(device, dtype),
-                        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(
-                            device, dtype
-                        ),
-                        num_inference_steps=denoise_steps,
-                        generator=generator,
-                        strength=1.0,
-                        pose_img=pose_img_tensor.to(device, dtype),
-                        text_embeds_cloth=prompt_embeds_c.to(device, dtype),
-                        cloth=garm_tensor.to(device, dtype),
-                        mask_image=mask,
-                        image=human_img,
-                        height=1024,
-                        width=768,
-                        ip_adapter_image=garm_img.resize((768, 1024)),
-                        guidance_scale=2.0,
-                    )[0]
-                    if is_checked_crop:
-                        final_img = final_background.copy()
-                        gen_img = images[0].resize(crop_size)
-                        final_img.paste(gen_img, (left_final, top_final))
-                        print(
-                            f"start_tryon: Pasted generated image onto final background at ({left_final}, {top_final})"
+                    if not isinstance(prompt, List):
+                        prompt = [prompt] * 1
+                    if not isinstance(negative_prompt, List):
+                        negative_prompt = [negative_prompt] * 1
+                    with torch.inference_mode():
+                        (
+                            prompt_embeds_c,
+                            _,
+                            _,
+                            _,
+                        ) = pipe.encode_prompt(
+                            prompt,
+                            num_images_per_prompt=1,
+                            do_classifier_free_guidance=False,
+                            negative_prompt=negative_prompt,
                         )
-                        img_path = save_output_image(
-                            final_img,
-                            base_path="outputs",
-                            base_filename="img",
-                            seed=current_seed,
+                    pose_img_tensor = (
+                        tensor_transfrom(pose_img).unsqueeze(0).to(device, dtype)
+                    )
+                    garm_tensor = (
+                        tensor_transfrom(garm_img).unsqueeze(0).to(device, dtype)
+                    )
+                    results = []
+                    current_seed = seed
+                    for i in range(number_of_images):
+                        if is_randomize_seed:
+                            current_seed = torch.randint(0, 2**32, size=(1,)).item()
+                        generator = (
+                            torch.Generator(device).manual_seed(current_seed)
+                            if seed != -1
+                            else None
                         )
-                        results.append(img_path)
-                    else:
-                        img_path = save_output_image(
-                            images[0], base_path="outputs", base_filename="img"
-                        )
-                        results.append(img_path)
-                return results, mask_gray
+                        current_seed = current_seed + i
+                        images = pipe(
+                            prompt_embeds=prompt_embeds.to(device, dtype),
+                            negative_prompt_embeds=negative_prompt_embeds.to(
+                                device, dtype
+                            ),
+                            pooled_prompt_embeds=pooled_prompt_embeds.to(device, dtype),
+                            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(
+                                device, dtype
+                            ),
+                            num_inference_steps=denoise_steps,
+                            generator=generator,
+                            strength=1.0,
+                            pose_img=pose_img_tensor.to(device, dtype),
+                            text_embeds_cloth=prompt_embeds_c.to(device, dtype),
+                            cloth=garm_tensor.to(device, dtype),
+                            mask_image=mask,
+                            image=human_img,
+                            height=1024,
+                            width=768,
+                            ip_adapter_image=garm_img.resize((768, 1024)),
+                            guidance_scale=2.0,
+                            dtype=dtype,
+                            device=device,
+                        )[0]
+                        if is_checked_crop:
+                            final_img = final_background.copy()
+                            # Ensure the generated image is resized to the computed crop_size
+                            gen_img = images[0].resize(crop_size)
+                            final_img.paste(gen_img, (left_final, top_final))
+                            print(
+                                f"start_tryon: Pasted generated image onto final background at ({left_final}, {top_final})"
+                            )
+                            img_path = save_output_image(
+                                final_img,
+                                base_path="outputs",
+                                base_filename="img",
+                                seed=current_seed,
+                            )
+                            results.append(img_path)
+                        else:
+                            img_path = save_output_image(
+                                images[0], base_path="outputs", base_filename="img"
+                            )
+                            results.append(img_path)
+                    return results, mask_gray
 
 
 garm_list = os.listdir(os.path.join(example_path, "cloth"))
@@ -475,6 +476,8 @@ with image_blocks as demo:
                 interactive=True,
                 height=550,
             )
+            # --- Attach auto-crop event: when an image is uploaded, if auto-crop is enabled,
+            # the auto_crop_upload function will process the image and update it.
             imgs.upload(
                 auto_crop_upload,
                 inputs=[
