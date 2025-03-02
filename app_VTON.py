@@ -99,14 +99,14 @@ def auto_crop_upload(editor_value, crop_flag):
             right = (width + target_width) / 2
             bottom = (height + target_height) / 2
             cropped_img = img.crop((left, top, right, bottom))
-            resized_img = cropped_img.resize((768, 1024))
+            resized_img = cropped_img.resize((1152, 1536))
             editor_value["background"] = resized_img
             if editor_value.get("layers"):
                 new_layers = []
                 for layer in editor_value["layers"]:
                     if layer is not None:
                         new_layer = layer.crop((left, top, right, bottom)).resize(
-                            (768, 1024)
+                            (1152, 1536)
                         )
                         new_layers.append(new_layer)
                     else:
@@ -233,7 +233,7 @@ def start_tryon(
     elif ENABLE_CPU_OFFLOAD:
         pipe.enable_model_cpu_offload()
 
-    garm_img = garm_img.convert("RGB").resize((768, 1024))
+    garm_img = garm_img.convert("RGB").resize((1152, 1536))
     human_img_orig = dict["background"].convert("RGB")
     print("start_tryon: Received human image from editor.")
 
@@ -252,9 +252,9 @@ def start_tryon(
                 orig.size,
             )
         orig_w, orig_h = orig.size
-        scale_factor = 1024 / orig_h
+        scale_factor = 1536 / orig_h
         final_w = int(orig_w * scale_factor)
-        final_h = 1024
+        final_h = 1536
         final_background = orig.resize((final_w, final_h))
         print(
             f"start_tryon: Downscaled original image to final background: {final_background.size} (scale factor: {scale_factor})"
@@ -276,14 +276,14 @@ def start_tryon(
         )
         human_img = human_img_orig
     else:
-        human_img = human_img_orig.resize((768, 1024))
-        print("start_tryon: Auto crop not enabled, resized human image to 768x1024.")
+        human_img = human_img_orig.resize((1152, 1536))
+        print("start_tryon: Auto crop not enabled, resized human image to 1152x1536.")
 
     if is_checked:
         keypoints = openpose_model(human_img.resize((384, 512)))
         model_parse, _ = parsing_model(human_img.resize((384, 512)))
         mask, mask_gray = get_mask_location("hd", category, model_parse, keypoints)
-        mask = mask.resize((768, 1024))
+        mask = mask.resize((1152, 1536))
         print("start_tryon: Auto-masking used")
     else:
         if (
@@ -296,7 +296,7 @@ def start_tryon(
                 mask_alpha = mask_layer.split()[-1]
             else:
                 mask_alpha = mask_layer.convert("L")
-            mask_alpha = mask_alpha.resize((768, 1024))
+            mask_alpha = mask_alpha.resize((1152, 1536))
             print(
                 "start_tryon: Manual mask alpha extracted:",
                 type(mask_alpha),
@@ -311,7 +311,7 @@ def start_tryon(
                 mask.size,
             )
         else:
-            mask = Image.new("L", (768, 1024), 0)
+            mask = Image.new("L", (1152, 1536), 0)
             print("start_tryon: No manual mask provided, using default black mask")
 
     mask_gray = (1 - transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
@@ -334,7 +334,7 @@ def start_tryon(
     )
     pose_img = args_apply.func(args_apply, human_img_arg)
     pose_img = pose_img[:, :, ::-1]
-    pose_img = Image.fromarray(pose_img).resize((768, 1024))
+    pose_img = Image.fromarray(pose_img).resize((1152, 1536))
 
     if pipe.text_encoder is not None:
         pipe.text_encoder.to(device)
@@ -414,9 +414,9 @@ def start_tryon(
                             cloth=garm_tensor.to(device, dtype),
                             mask_image=mask,
                             image=human_img,
-                            height=1024,
-                            width=768,
-                            ip_adapter_image=garm_img.resize((768, 1024)),
+                            height=1536,
+                            width=1152,
+                            ip_adapter_image=garm_img.resize((1152, 1536)),
                             guidance_scale=2.0,
                             dtype=dtype,
                             device=device,
